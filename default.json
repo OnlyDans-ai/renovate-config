@@ -1,0 +1,57 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "OnlyDans org-wide dependency policy — the ONE home (hub preset, per Ironworks doctrine). Products extend with `github>OnlyDansAI/renovate-config` and override only repo-specifics. Change policy here; all repos inherit.",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommits"],
+  "timezone": "America/Chicago",
+  "schedule": ["before 9am on monday"],
+  "prConcurrentLimit": 10,
+  "labels": ["dependencies"],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "schedule": ["at any time"],
+    "labels": ["dependencies", "security"],
+    "prPriority": 10
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 9am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "JS ecosystems (npm/yarn/pnpm via the npm manager): the lockfile regenerates WITH the bump — cures the bumped-manifest-stale-lock CI disease (staffcloud PR #105/#106 receipt)",
+      "matchManagers": ["npm"],
+      "rangeStrategy": "update-lockfile",
+      "groupName": "js-deps",
+      "commitMessagePrefix": "chore(deps):"
+    },
+    {
+      "description": "Python (pep621/uv): uv.lock regenerates with every pyproject bump (staffcloud 2026-06-03 cure)",
+      "matchManagers": ["pep621"],
+      "rangeStrategy": "update-lockfile",
+      "groupName": "python-deps",
+      "labels": ["dependencies", "python"],
+      "commitMessagePrefix": "chore(deps):"
+    },
+    {
+      "description": "Dev-only dependencies: automerge patch+minor once CI is green — never touches a prod artifact, so the bot may finish the job",
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "automerge": true
+    },
+    {
+      "description": "GitHub Actions: monthly, grouped, automerge patch/minor/digest",
+      "matchManagers": ["github-actions"],
+      "groupName": "ci-deps",
+      "commitMessagePrefix": "ci(deps):",
+      "schedule": ["before 9am on the first day of the month"],
+      "matchUpdateTypes": ["patch", "minor", "digest"],
+      "automerge": true
+    },
+    {
+      "description": "MAJORS are Danny-gated via the Dependency Dashboard checkbox — the bot recommends, a human decides (house rule: recommend-never-auto). LAST rule so it wins over any automerge above",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true,
+      "automerge": false
+    }
+  ]
+}
