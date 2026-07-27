@@ -7,7 +7,7 @@ Every repo consumes it with a 3-line `renovate.json`:
 ```json
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>OnlyDansAI/renovate-config"]
+  "extends": ["github>OnlyDans-ai/renovate-config"]
 }
 ```
 
