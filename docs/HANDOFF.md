@@ -22,9 +22,10 @@ Updated 2026-09-21 18:00 CDT (onboarded onto the OS; the preset itself is unchan
 
 ## Open decisions (Danny)
 
-- If the GitHub repo is public (Renovate presets often must be readable by the app), pushing
-  this commit publishes the OS scaffold: AGENTS.md's working agreement, the skills, the MCP
-  file. Nothing in it is a secret, but it is Danny's call whether it goes out.
+- **The GitHub repo is public** (Renovate must be able to read the preset). Pushing the
+  onboarding commit publishes the OS scaffold: AGENTS.md's working agreement, the skills, the
+  MCP file. Nothing in it is a secret, but whether it goes out is Danny's call. Until then the
+  commit stays local and the preset on GitHub is untouched.
 
 ## Constraints
 
