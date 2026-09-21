@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# os-hook: pre-commit — secret scan on staged content. Fails CLOSED: no gitleaks, no commit.
+# Installed by os init and refreshed by os sync; the repo's own pre-commit runs after it as .githooks/pre-commit.local.
+set -uo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit BLOCKED: gitleaks is not installed." >&2
+  echo "Install: https://github.com/gitleaks/gitleaks#installing (brew install gitleaks," >&2
+  echo "or go install github.com/gitleaks/gitleaks/v8@latest). Then retry the commit." >&2
+  exit 1
+fi
+
+# Every staged blob goes to gitleaks on stdin, one file at a time, from an empty directory with the
+# default rules only. Blobs, not the patch: a `-diff` entry in a tracked .gitattributes turns the
+# patch into "Binary files differ", and a commit that removes a secret shows it on a "-" line the
+# scanner cannot tell from an addition (plan review 2026-09-21). Findings and the leak count print at warn level; the two
+# info lines gitleaks logs per clean blob do not (26 lines on a 13-file commit, 2026-09-21). A repo's .gitleaks.toml or
+# .gitleaksignore, GITLEAKS_CONFIG* in the environment and a `gitleaks:allow` comment each switch
+# detection off, and all three are the committer's (or a cloned repo's) to write; none is read here.
+neutral="$(mktemp -d)" && [ -d "$neutral" ] || { echo "pre-commit BLOCKED: cannot create a scratch directory (TMPDIR?)" >&2; exit 1; }
+trap 'rm -rf "$neutral"' EXIT
+list="$neutral/.list"; blob="$neutral/.blob"
+git diff --staged --name-only --diff-filter=d -z > "$list" || { echo "pre-commit BLOCKED: git diff --staged failed; nothing was scanned" >&2; exit 1; }
+rc=0
+while IFS= read -r -d '' f; do
+  [ -n "$f" ] || continue
+  # :0:<path>, stage zero spelled out: a path that begins with a digit and a colon would otherwise be read as a stage
+  if ! git show ":0:$f" > "$blob" 2>/dev/null; then echo "pre-commit: cannot read staged $f from the index" >&2; rc=1; continue; fi
+  if ! (cd "$neutral" && env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML gitleaks stdin --no-banner --redact --ignore-gitleaks-allow -v --log-level warn < "$blob"); then
+    echo "pre-commit: likely secret in staged $f (redacted above)" >&2
+    rc=1
+  fi
+done < "$list"
+if [ "$rc" -ne 0 ]; then
+  echo "pre-commit BLOCKED: gitleaks found a likely secret in the staged changes." >&2
+  echo "Remove it (env var or 1Password, never a tracked file) and re-stage." >&2
+  exit 1
+fi
+
+# The repo's own check runs once the scan passed. Present but not executable is a mistake, and a mistake blocks
+# rather than skips: a check that silently stopped running is how the hook got here in the first place.
+OWN="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.githooks/pre-commit.local"
+if [ -e "$OWN" ] || [ -L "$OWN" ]; then   # a dangling symlink is present, not absent: it blocks below
+  [ -x "$OWN" ] || { echo "pre-commit BLOCKED: .githooks/pre-commit.local exists but is not executable, or a broken link (chmod +x it, fix it, or remove it)." >&2; exit 1; }
+  "$OWN" "$@"; exit $?
+fi
+exit 0

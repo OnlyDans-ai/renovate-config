@@ -1,0 +1,6 @@
+# MCP servers this repo uses, one per line: <name> [account=<1Password service account>] [KEY=value ...]
+# Names come from ~/.os/mcp/registry.json (`os mcp ls`). Values are non-secret literals or
+# op://Vault/item/field references, never a secret. KEY is an env var, `${KEY}` placeholder or
+# header the registry DECLARES for that server; nothing else is accepted. `os mcp on|off <name>`
+# edits this file and re-renders .mcp.json, .codex/config.toml and opencode.json.
+# context7 and exa are always on and need no line.

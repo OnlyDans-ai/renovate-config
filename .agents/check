@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# os review gate 0: default.json is valid JSON and still carries the keys the policy stands on (README.md:
+# the weekly schedule, its timezone, the package rules, vulnerability alerts). Offline and under a second.
+# Renovate's own validator (`npx --package renovate renovate-config-validator default.json`) downloads the whole
+# of Renovate, so it is a by-hand step before a policy change, not a gate.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+jq -e 'type == "object" and (.extends | type == "array") and (.schedule | type == "array") and (.timezone | type == "string")
+       and (.packageRules | type == "array" and length > 0) and (.vulnerabilityAlerts | type == "object")' default.json >/dev/null

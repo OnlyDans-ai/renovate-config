@@ -1,0 +1,17 @@
+{
+  "plansDirectory": "plans",
+  "autoMemoryDirectory": ".agents/memory",
+  "permissions": {
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Bash(rm -rf .git*)"
+    ],
+    "ask": [
+      "Bash(git push*)"
+    ]
+  }
+}

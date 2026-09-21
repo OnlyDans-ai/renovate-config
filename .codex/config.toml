@@ -1,0 +1,10 @@
+# os:mcp:start — rendered by `os mcp` from .agents/mcp; edit that file, not this block. Keep it last.
+[mcp_servers.context7]
+command = "os-mcp"
+args = ["context7"]
+
+[mcp_servers.exa]
+command = "os-mcp"
+args = ["exa"]
+
+# os:mcp:end

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "context7": {
+      "type": "local",
+      "command": [
+        "os-mcp",
+        "context7"
+      ],
+      "enabled": true
+    },
+    "exa": {
+      "type": "local",
+      "command": [
+        "os-mcp",
+        "exa"
+      ],
+      "enabled": true
+    }
+  }
+}

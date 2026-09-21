@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# os-hook: pre-push — deploy-branch grant check (block), unreviewed-commit count (advisory).
+# Installed by os init and refreshed by os sync; the repo's own pre-push runs after it as .githooks/pre-push.local,
+# with the same arguments and the same ref lines on stdin.
+set -uo pipefail
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+DEPLOY_FILE="$REPO/.agents/deploy-branches"
+GRANT_FILE="$HOME/.os/push-grant"
+ZERO='0000000000000000000000000000000000000000'
+
+is_deploy_branch() { # $1 = bare branch name
+  [ -f "$DEPLOY_FILE" ] || return 1
+  grep -Fxq "$1" "$DEPLOY_FILE" 2>/dev/null
+}
+
+grant_valid() {
+  [ -f "$GRANT_FILE" ] || return 1
+  local expires now
+  expires="$(sed -n 's/^expires=//p' "$GRANT_FILE" | head -1)"
+  [ -n "$expires" ] || return 1
+  now="$(date +%s)"
+  [ "$expires" -gt "$now" ] 2>/dev/null
+}
+
+# stdin (one line per ref being pushed) is kept in a file so the repo's own hook can read the same lines
+REFS="$(mktemp)" || { echo "PRE-PUSH BLOCKED: cannot create a scratch file (TMPDIR?)" >&2; exit 1; }
+trap 'rm -f "$REFS"' EXIT
+cat > "$REFS"
+
+blocked=0
+while read -r _localref localsha remoteref _remotesha; do
+  [ -n "${remoteref:-}" ] || continue
+  [ "${localsha:-}" = "$ZERO" ] && continue
+  branch="${remoteref#refs/heads/}"
+  is_deploy_branch "$branch" || continue
+  if ! grant_valid; then
+    echo "PRE-PUSH BLOCKED: '$branch' is a deploy branch and there is no unexpired push grant." >&2
+    echo "Get Danny's word, then: os push-ok <duration>  (e.g. os push-ok 2h)" >&2
+    blocked=1
+  fi
+done < "$REFS"
+
+[ "$blocked" = 1 ] && exit 1
+
+# Advisory: commits since the last Reviewed-by: trailer, on the branch(es) being pushed.
+last_reviewed="$(git log --grep='^Reviewed-by:' -1 --format=%H 2>/dev/null || true)"
+if [ -n "$last_reviewed" ]; then
+  count="$(git rev-list --count "$last_reviewed"..HEAD 2>/dev/null || echo 0)"
+  [ "$count" -gt 0 ] 2>/dev/null && \
+    echo "pre-push: $count commit(s) since the last Reviewed-by: trailer (advisory, not blocking)." >&2
+fi
+
+# Advisory: review units whose verify pass left findings open (os review --close settles each).
+for f in "$REPO"/.tribunal/*/open; do
+  [ -f "$f" ] || continue
+  n="$(grep -c . "$f" 2>/dev/null || true)"; [ "${n:-0}" -gt 0 ] || continue
+  echo "pre-push: review unit $(basename "$(dirname "$f")") has $n open finding(s) — os review --close <unit> <n> test|danny \"<how>\" (advisory, not blocking)." >&2
+done
+
+# The repo's own pre-push (os init moves a pre-existing one here, or shims one from an older hooks dir) runs last,
+# with the same arguments and the same ref lines. Present but not executable blocks, never skips.
+OWN="$REPO/.githooks/pre-push.local"
+if [ -e "$OWN" ] || [ -L "$OWN" ]; then   # a dangling symlink is present, not absent: it blocks below
+  [ -x "$OWN" ] || { echo "PRE-PUSH BLOCKED: .githooks/pre-push.local exists but is not executable, or a broken link (chmod +x it, fix it, or remove it)." >&2; exit 1; }
+  "$OWN" "$@" < "$REFS"; exit $?
+fi
+exit 0
