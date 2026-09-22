@@ -44,10 +44,19 @@ for what you cannot resolve yourself: credentials, spend, priority, or a scope c
   that other repos could use in `~/.agents/memory/<topic>.md`, one file per topic, edited in place
   by any repo, and linked from this repo's memory rather than copied. Chat history does not travel
   between harnesses.
-- An OS defect or a suggestion for the OS, met in any repo: work around it locally, then file a
-  case at `~/projects/os/inbox/<date>-<repo>-<slug>.md` (shape in that folder's README); never
-  edit the OS from a project session. The OS session triages the inbox at its start: adopt,
-  absorb, or reject with the reason kept in `inbox/rejected/`.
+- The project section of `AGENTS.md` (below `os:project:start`) is this repo's own and reads the
+  same on every harness: how to run, test and deploy it and the boundaries every turn needs, a
+  page (60 lines) at most; a standing fact goes to memory, state to the handoff, and a rule only
+  one harness can follow goes in that harness's own folder in the repo (`.claude/`, `.codex/`),
+  pointed to from the section. The core block above it is the OS's; `os sync` rewrites it.
+- An OS defect or a suggestion for the OS (the `os` CLI, a guard, a skill, a rendered file, or a
+  harness binding the OS deploys: a deny rule, a hook, a sandbox root, a setting, on any harness
+  including the one you run on), met in any repo: work around it locally, then file a case at
+  `~/projects/os/inbox/<date>-<repo>-<slug>.md` (shape in that folder's README); if that path
+  cannot be written from your sandbox, park the case under `## OS case` at the top of
+  `docs/HANDOFF.md` and say so at close. Never edit the OS or a harness binding from a project
+  session. The OS session triages the inbox and the parked cases at its start: adopt, absorb,
+  route to the harness that owns the binding, or reject with the reason kept in `inbox/rejected/`.
 - Delegate big reads and disjoint lanes to agents; keep judgment here. Delegate at the
   lowest model that does the job: Sonnet-class reads and implements, Opus-class guards
   security, your own model only where judgment is the work. A loop needs an independent
