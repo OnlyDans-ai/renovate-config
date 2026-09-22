@@ -37,9 +37,10 @@ for what you cannot resolve yourself: credentials, spend, priority, or a scope c
 
 ## Working state lives in the repo
 
-- Read `docs/HANDOFF.md` first; write it at close. Plans live in `plans/`. Durable memory lives in
-  `.agents/memory/`: read the index when you need history, write a topic file when you learn a
-  durable fact. Chat history does not travel between harnesses.
+- Read `docs/HANDOFF.md` first, then the two memory indexes: `.agents/memory/MEMORY.md` (this repo)
+  and `~/.agents/memory/MEMORY.md` (what holds across repos). Write the handoff at close. Plans live
+  in `plans/`. A durable fact becomes a topic file in the memory it belongs to, indexed by one line.
+  Chat history does not travel between harnesses.
 - Delegate big reads and disjoint lanes to agents; keep judgment here. Delegate at the
   lowest model that does the job: Sonnet-class reads and implements, Opus-class guards
   security, your own model only where judgment is the work. A loop needs an independent
