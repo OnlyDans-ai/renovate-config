@@ -9,9 +9,6 @@
       "Bash(rm -rf /*)",
       "Bash(rm -rf ~*)",
       "Bash(rm -rf .git*)"
-    ],
-    "ask": [
-      "Bash(git push*)"
     ]
   }
 }
