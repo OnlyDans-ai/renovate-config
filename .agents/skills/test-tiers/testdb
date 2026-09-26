@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# testdb: a throwaway Postgres database per test worker, cloned from a template built once per migration state.
+# Part of the OS test-tiers standard (SKILL.md beside this file; designs: ~/projects/os/plans/test-db-2026-09-25.md,
+# ~/projects/os/plans/testdb-server-per-roles-2026-09-25.md). One RAM-backed docker server per repo per image and
+# roles, holding a template per migration state in use, loopback only; it drops only databases it named, whose owner
+# is gone, and removes only containers it labelled for this repo.
+set -euo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+
+usage() {
+  cat <<'EOF'
+usage: testdb url [--role <role>] | env | build | drop <url|name> | reap | guard | up | down | status | id
+  url     print the URL of a fresh database cloned from this repo's current template (built first if new);
+          --role connects as that role: it must exist with LOGIN, without SUPERUSER or BYPASSRLS, and own no
+          table whose row-level security it would bypass
+  env     one fresh clone, printed as VAR=url lines for every pair in TESTDB_ENV (default DATABASE_URL=postgres)
+  build   build the current template, or wait for a build already running; no clone. A gate runs it before its
+          parallel lane. The build's output goes to a log in the git dir, printed (its tail) only when it fails
+  drop    drop a database testdb made (t_<epoch>_<pid>_<hex>)
+  reap    drop clones whose owner is gone (or, owner unknown, older than TESTDB_MAX_AGE), templates idle an hour
+          (never the current one), and this repo's servers idle a day with no live owner
+  guard   exit 2, naming the variables, when the environment points at a Postgres that is not on this machine
+  up      start the server for the current image and roles; url does this itself
+  down    remove every server of this repo (nothing is lost: each is rebuilt on demand)
+  status  this repo's servers, templates and clones
+  id      the server name and template name of the current migration state
+Reads .agents/testdb.conf at the repo top: TESTDB_IMAGE, TESTDB_MIGRATE, TESTDB_HASH (required); TESTDB_ROLES,
+TESTDB_SEED, TESTDB_ENV, TESTDB_IGNORE_ENV, TESTDB_RAM, TESTDB_SERVER (optional). The build sets DATABASE_URL,
+TESTDB_URL and each TESTDB_ENV variable to the template being built as superuser, and TESTDB_URL_<ROLE> as each role
+TESTDB_ENV names. Migrate and seed must not change cluster-wide roles (the server is shared by every state with the
+same roles): role changes go in TESTDB_ROLES, or TESTDB_SERVER=state keeps a server per migration state.
+Needs git, docker and bash; no host psql.
+EOF
+}
+
+die() { echo "testdb: $*" >&2; exit 1; }
+
+case "${1:-}" in url|env|build|drop|reap|guard|up|down|status|id) ;; -h|--help|help) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
+cmd="$1"; shift
+
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run it inside a git repo"
+top="$(readlink -f "$top")"
+cfg="$top/.agents/testdb.conf"
+[ -f "$cfg" ] || die "no .agents/testdb.conf in $top (see the test-tiers skill)"
+conf() { # the last KEY=value line; one level of matching quotes is removed. Read, never sourced.
+  local v; v="$(sed -n "s/^$1=//p" "$cfg" | tail -1)"
+  case "$v" in \"*\") v="${v#\"}"; v="${v%\"}" ;; \'*\') v="${v#\'}"; v="${v%\'}" ;; esac
+  printf '%s' "$v"
+}
+IMAGE="$(conf TESTDB_IMAGE)"; MIGRATE="$(conf TESTDB_MIGRATE)"; HASHPATHS="$(conf TESTDB_HASH)"
+ROLES="$(conf TESTDB_ROLES)"; SEED="$(conf TESTDB_SEED)"; RAM="$(conf TESTDB_RAM)"; RAM="${RAM:-4g}"
+ENVMAP="$(conf TESTDB_ENV)"; ENVMAP="${ENVMAP:-DATABASE_URL=postgres}"; IGNORE_ENV=" $(conf TESTDB_IGNORE_ENV) "
+MAXAGE="${TESTDB_MAX_AGE:-7200}"; SERVERMODE="$(conf TESTDB_SERVER)"; TPL_CAP=4
+[ -n "$IMAGE" ] && [ -n "$MIGRATE" ] && [ -n "$HASHPATHS" ] || die ".agents/testdb.conf needs TESTDB_IMAGE, TESTDB_MIGRATE and TESTDB_HASH"
+[[ "$MAXAGE" =~ ^[0-9]+$ ]] || die "TESTDB_MAX_AGE must be seconds"
+case "$SERVERMODE" in ""|shared|state) ;; *) die "TESTDB_SERVER must be shared (the default) or state" ;; esac
+
+# --- the guard: every variable, whatever its name, read before anything connects ----------------------------------
+
+loopback_host() { # $1 one host → 0 for localhost, a numeric 127/8 address, ::1, [::1] or a socket directory
+  case "$1" in localhost|::1|\[::1\]|/*) return 0 ;; esac
+  [[ "$1" =~ ^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]   # numeric: never a name that starts like one
+}
+loopback_url() { # $1 URL → 0 when it names one loopback host and no query key (decoded) could move the connection
+  local u="$1" rest auth host query kv key
+  case "$u" in postgres://*|postgresql://*) ;; *) return 1 ;; esac
+  rest="${u#*://}"; auth="${rest%%[/?]*}"; host="${auth##*@}"
+  case "$host" in *,*) return 1 ;; esac   # a multi-host URL is refused whole
+  case "$host" in \[*\]*) host="${host%%]*}]" ;; *) host="${host%%:*}" ;; esac
+  loopback_host "$host" && [ "${host:0:1}" != / ] || return 1
+  case "$rest" in *\?*) query="${rest#*\?}" ;; *) return 0 ;; esac
+  IFS='&' read -ra kv <<<"$query"
+  for key in "${kv[@]}"; do
+    key="${key%%=*}"; key="$(printf '%b' "${key//%/\\x}")"; key="${key,,}"   # libpq decodes %68ost to host
+    case "$key" in host|hostaddr|service|servicefile|dbname) return 1 ;; esac
+  done
+}
+conninfo_ok() { # $1 a key=value connection string → 0 when every host= and hostaddr= in it is loopback
+  local h
+  while IFS= read -r h; do loopback_host "${h#*=}" || return 1
+  done < <(grep -oE "(^|[[:space:]])host(addr)?=[^[:space:]]*" <<<"$1" | sed 's/^[[:space:]]*//; s/'\''//g' | tr ',' '\n' | sed 's/^host\(addr\)\{0,1\}=//')
+  ! grep -qE "(^|[[:space:]])service=" <<<"$1"
+}
+
+GUARD_BAD=""
+while IFS= read -r -d '' kv; do
+  name="${kv%%=*}"; value="${kv#*=}"
+  case "$IGNORE_ENV" in *" $name "*) continue ;; esac   # only the repo's config file exempts a variable
+  case "$name" in
+    PGHOST|PGHOSTADDR)
+      IFS=, read -ra hosts <<<"$value"
+      for h in "${hosts[@]}"; do loopback_host "$h" || { GUARD_BAD+=" $name"; break; }; done; continue ;;
+    PGSERVICE|PGSERVICEFILE) GUARD_BAD+=" $name"; continue ;;
+  esac
+  if [[ "$value" == *postgres://* || "$value" == *postgresql://* ]]; then
+    while IFS= read -r u; do   # each URL in the value on its own line, cut where a quote or a space ends it
+      loopback_url "${u%%[[:space:]\"\']*}" || { GUARD_BAD+=" $name"; break; }
+    done < <(sed 's#postgres\(ql\)\{0,1\}://#\n&#g' <<<"$value" | grep -E '^postgres(ql)?://')
+  elif grep -qE '(^|[[:space:]])(host|hostaddr|service)=' <<<"$value" && grep -qE '(^|[[:space:]])(dbname|user)=' <<<"$value"; then
+    conninfo_ok "$value" || GUARD_BAD+=" $name"
+  fi
+done < <(env -0)
+guard() {
+  [ -z "$GUARD_BAD" ] || { echo "testdb:$GUARD_BAD point(s) at a Postgres that is not on this machine; tests never touch a real database (unset it for the test run, or list a variable tests never read in TESTDB_IGNORE_ENV in .agents/testdb.conf)" >&2; exit 2; }
+}
+
+# libpq reads these; none may steer a connection testdb makes or hands out.
+unset PGHOST PGHOSTADDR PGPORT PGSERVICE PGSERVICEFILE PGDATABASE PGUSER PGPASSWORD PGPASSFILE PGOPTIONS
+
+# --- names: the main checkout names the servers, the server key the image and roles, the template key the state ---
+
+common="$(git -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || die "no git dir"
+common="$(readlink -f "$common")"
+main="$(dirname "$common")"   # every worktree and lane of the repo names its servers from the main checkout
+id="$(printf '%s' "$common" | sha256sum | cut -c1-8)"
+slug="$(basename "$main" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-\n' '-' | cut -c1-32)"
+PREFIX="${TESTDB_PREFIX:-os-pg-$slug-$id}"
+USED="$common/testdb-used"       # <server>: touched on every use; a server with no mark is never removed by reap
+LEASES="$common/testdb-leases"   # <server>/<clone>: "<pid namespace> <pid> <start time>" of the process it was made for
+TUSED="$common/testdb-tpl-used"  # <server>/<template>: touched before its build and on every use; reap reads its age
+
+template_hash() { # every input the template is built from: the declared files (tracked or not, ignored excluded),
+  # the roles file, the config file itself (so a changed migrate or seed command counts), and the image
+  local files
+  [ -n "$(cd "$top" && set -f && git ls-files -c -o --exclude-standard -- $HASHPATHS | head -1)" ] || die "TESTDB_HASH ($HASHPATHS) matches no file"
+  files="$(cd "$top" && set -f && git ls-files -z -c -o --exclude-standard -- $HASHPATHS ${ROLES:+"$ROLES"} .agents/testdb.conf \
+    | LC_ALL=C sort -zu | tr '\0' '\n')"
+  { (cd "$top" && tr '\n' '\0' <<<"$files" | xargs -0 -r sha256sum); printf '%s\n' "$IMAGE"; } | sha256sum | cut -c1-16
+}
+state_names() { # only the commands that need the current state compute it: down, guard and drop by URL still work
+  # when the migration files are gone, which is when cleaning up matters
+  local f
+  [ -z "$ROLES" ] || [ -f "$top/$ROLES" ] || die "TESTDB_ROLES ($ROLES) does not exist"
+  for f in ${ROLES:+"$ROLES"} .agents/testdb.conf; do   # a tracked file is never ignored, whatever the patterns say
+    ! git -C "$top" check-ignore -q -- "$f" \
+      || die "$f is git-ignored: it keys the template, and CI cannot have it (un-ignore it: !$f in .gitignore)"
+  done
+  for f in $ENVMAP; do   # checked before anything is created: a bad pair would leave a half-built database behind
+    [[ "${f%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "TESTDB_ENV: '${f%%=*}' is not a variable name"
+    case "${f%%=*}" in TESTDB_URL|TESTDB_URL_*) die "TESTDB_ENV: ${f%%=*} is testdb's own name (the build sets TESTDB_URL and TESTDB_URL_<ROLE>)" ;; esac
+    role_ok "${f#*=}"
+  done
+  HASH="$(template_hash)" || exit 1
+  TPL="tpl_$HASH"; NAME="$PREFIX-$(server_key)"
+}
+server_key() { # what a server is shared by: its image, its settings, and its roles (global to a cluster), so two
+  # states with the same roles share one; with TESTDB_SERVER=state the whole template key too, a server per state
+  { printf 'image %s\nram %s\n' "$IMAGE" "$RAM"
+    [ -z "$ROLES" ] || { printf 'roles\n'; cat "$top/$ROLES" 2>/dev/null || true; }
+    [ "$SERVERMODE" != state ] || printf 'state %s\n' "$HASH"
+  } | sha256sum | cut -c1-16
+}
+
+# --- the server ------------------------------------------------------------------------------------------------------
+
+q() { # $1 statement, $2 database (default postgres): rows unaligned, run inside the container over TCP (the image's
+  # init-time server listens on the socket only, so it never answers), stdin closed so a read loop keeps its input
+  # search_path=pg_catalog: a migration can shadow pg_class or an operator in public, or set postgres's own
+  # search_path; a startup option outranks role and database settings, so testdb's catalog reads see the catalog
+  docker exec -e PGOPTIONS='-c client_min_messages=warning -c search_path=pg_catalog' "$NAME" psql -h 127.0.0.1 -U postgres -d "${2:-postgres}" \
+    -X -v ON_ERROR_STOP=1 -qtAc "$1" </dev/null
+}
+qfile() { docker exec -i "$NAME" psql -h 127.0.0.1 -U postgres -d "$1" -X -v ON_ERROR_STOP=1 -q -f -; }   # $1 db, SQL on stdin
+db_url() { printf 'postgresql://%s@127.0.0.1:%s/%s\n' "${2:-postgres}" "$PORT" "$1"; }   # $1 database, $2 role
+
+server_up() {
+  local state pgdata ready=""
+  command -v docker >/dev/null 2>&1 || die "docker is not installed"
+  mkdir -p "$USED" "$LEASES/$NAME"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$common/testdb-$NAME.server.lock"; flock 9   # two agents on a new state start one server, not a name clash
+  fi
+  touch "$USED/$NAME"   # marked before it exists, so a neighbour's reap never sees a server without a mark
+  if state="$(docker inspect -f '{{.State.Running}}|{{index .Config.Labels "os.testdb"}}|{{index .Config.Labels "os.testdb.repo"}}' "$NAME" 2>/dev/null)"; then
+    [ "${state#*|}" = "1|$common" ] || die "a container named $NAME exists and testdb did not make it; left alone (it is not a testdb server of this repo)"
+    [ "${state%%|*}" = true ] || docker start "$NAME" >/dev/null   # stopped (a reboot): its RAM disk starts empty
+  else
+    # a failed pipe in an assignment exits here under pipefail, silently: every probe says what failed (wingbarn
+    # case 2026-09-25: an image not on a fresh CI runner exited 1 before the pull ever ran)
+    pgdata="$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$IMAGE" 2>/dev/null | sed -n 's/^PGDATA=//p')" || pgdata=""
+    if [ -z "$pgdata" ]; then   # not on this machine yet: pulled, then read again
+      docker pull -q "$IMAGE" >/dev/null || die "pulling $IMAGE failed"
+      pgdata="$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$IMAGE" | sed -n 's/^PGDATA=//p')" \
+        || die "reading $IMAGE after the pull failed"
+    fi
+    [ -n "$pgdata" ] || die "$IMAGE sets no PGDATA; is it a postgres image?"
+    docker run -d --name "$NAME" --label os.testdb=1 --label "os.testdb.repo=$common" \
+      --shm-size 256m --tmpfs "$pgdata:rw,size=$RAM" -p 127.0.0.1::5432 -e POSTGRES_HOST_AUTH_METHOD=trust \
+      "$IMAGE" postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
+      -c max_connections=500 -c shared_buffers=256MB >/dev/null
+  fi
+  for _ in $(seq 1 120); do
+    q 'select 1' >/dev/null 2>&1 && ready=1 && break; sleep 0.5
+  done
+  exec 9>&-
+  [ "$ready" = 1 ] || die "$NAME did not accept connections within 60 s"
+  PORT="$(docker port "$NAME" 5432/tcp 2>/dev/null | sed -n 's/^127\.0\.0\.1://p' | head -1)" || true   # empty: said below
+  [ -n "$PORT" ] || die "$NAME publishes no loopback port"
+}
+
+role_snapshot() { # one line per role: its name and an md5 of its pg_authid row, its memberships and its cluster-wide
+  # settings, hashed inside Postgres so no password hash ever leaves it (pg_roles masks passwords)
+  q "select a.rolname || ' ' || md5(a::text
+       || coalesce((select string_agg(m::text, ',' order by m::text) from pg_auth_members m where m.member = a.oid), '')
+       || coalesce((select string_agg(s.setconfig::text, ',') from pg_db_role_setting s where s.setrole = a.oid and s.setdatabase = 0), ''))
+     from pg_authid a order by 1"
+}
+
+build_template() { # built under a new name and renamed, so nobody ever clones a half-built one
+  local b url pair r before after changed
+  local -a vars=(DATABASE_URL="" TESTDB_URL="")
+  b="b_${HASH}_$(date +%s)_$$"
+  q "create database \"$b\"" >/dev/null
+  url="$(db_url "$b")"
+  for pair in $ENVMAP; do vars+=("${pair%%=*}="); done   # every variable the repo's tools read points at the build
+  vars=("${vars[@]/%/$url}")
+  for pair in $ENVMAP; do   # and each of the app's roles, for a step that must run as one (tables owned by it)
+    r="${pair#*=}"; vars+=("TESTDB_URL_${r^^}=$(db_url "$b" "$r")")   # TESTDB_ENV was checked in state_names
+  done
+  if { [ -z "$ROLES" ] || qfile "$b" < "$top/$ROLES" >/dev/null; } \
+     && before="$(role_snapshot)" \
+     && (cd "$top" && env "${vars[@]}" bash -c "$MIGRATE") \
+     && { [ -z "$SEED" ] || (cd "$top" && env "${vars[@]}" bash -c "$SEED"); } \
+     && after="$(role_snapshot)"; then
+    # the role guard: the server is shared by every state with these roles, so migrate and seed must leave them as
+    # the roles file made them. Dropping the build cannot undo a role change; ensure_template takes the server out
+    changed="$(comm -3 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | awk '{print $1}' | sort -u | paste -sd' ' -)"
+    if [ -n "$changed" ] && [ "$SERVERMODE" != state ]; then
+      q "drop database if exists \"$b\" with (force)" >/dev/null 2>&1 || true
+      echo "testdb: roles changed: $changed"; exit 3
+    fi
+    if q "alter database \"$b\" rename to \"$TPL\"" >/dev/null 2>&1; then
+      q "alter database \"$TPL\" is_template true allow_connections false" >/dev/null
+    else
+      q "drop database if exists \"$b\" with (force)" >/dev/null   # another run finished the same template first
+    fi
+  else
+    q "drop database if exists \"$b\" with (force)" >/dev/null 2>&1 || true
+    die "building $TPL failed (roles, migrate or seed above); nothing was kept"
+  fi
+}
+
+build_lock() { # $1 -n: only if free. Builds and template drops on one server hold it, one at a time
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 8>"$common/testdb-$NAME.lock"; flock ${1:-} 8
+}
+tpl_ready() { [ -n "$(q "select 1 from pg_database where datname = '$TPL' and datistemplate")" ]; }
+
+drop_template() { # $1 a template of this server, the build lock held; Postgres drops no database flagged a template
+  if q "alter database \"$1\" is_template false" >/dev/null 2>&1 && q "drop database \"$1\"" >/dev/null 2>&1; then
+    rm -f "$TUSED/$NAME/$1"
+  else
+    echo "testdb: could not drop template $1 on $NAME; kept" >&2; return 1
+  fi
+}
+reap_templates() { # the build lock held. Drops each template but the current one that is idle an hour or has no mark
+  # (every build marks its template first: one without was made before marks existed); with $1 = room, then makes
+  # room for one more under the cap, least recently used first, never one used in the last ten minutes
+  local now t m n oldest oldest_ts
+  local -a tpls kept=()
+  now="$(date +%s)"; mkdir -p "$TUSED/$NAME"
+  mapfile -t tpls < <(q "select datname from pg_database where datname ~ '^tpl_[0-9a-f]{16}\$' order by 1")
+  for m in "$TUSED/$NAME"/tpl_*; do   # a mark whose template is gone
+    [ -f "$m" ] && [ "${m##*/}" != "$TPL" ] || continue
+    case " ${tpls[*]} " in *" ${m##*/} "*) ;; *) rm -f "$m" ;; esac
+  done
+  n="${#tpls[@]}"
+  for t in "${tpls[@]}"; do
+    [ "$t" != "$TPL" ] || continue
+    m="$TUSED/$NAME/$t"
+    if [ ! -f "$m" ] || [ $((now - $(stat -c %Y "$m"))) -gt 3600 ]; then
+      drop_template "$t" && n=$((n - 1))
+    else
+      kept+=("$t")
+    fi
+  done
+  [ "${1:-}" = room ] || return 0
+  while [ $((n + 1)) -gt "$TPL_CAP" ]; do
+    oldest=""; oldest_ts=$((now - 600))
+    for t in "${kept[@]}"; do
+      [ -n "$t" ] || continue
+      m="$(stat -c %Y "$TUSED/$NAME/$t" 2>/dev/null)" || continue
+      [ "$m" -ge "$oldest_ts" ] || { oldest="$t"; oldest_ts="$m"; }
+    done
+    [ -n "$oldest" ] || { echo "testdb: $NAME holds $n templates, each used in the last ten minutes, so the cap of $TPL_CAP is exceeded until one idles" >&2; break; }
+    drop_template "$oldest" || break
+    n=$((n - 1)); kept=("${kept[@]/#$oldest/}")
+  done
+}
+
+taint() { # the role guard tripped: this server leaves service under a new name, which a running container allows. Its
+  # marks and leases move with it; clones already handed out keep working on its port. The next url starts a clean
+  # server under the proper name, and reap removes this one once no live owner holds a clone on it
+  local new d
+  new="$NAME-x$(date +%s)"
+  docker rename "$NAME" "$new" >/dev/null || return 1
+  for d in "$USED" "$LEASES" "$TUSED"; do [ ! -e "$d/$NAME" ] || mv "$d/$NAME" "$d/$new"; done
+  printf '%s\n' "$new"
+}
+
+ensure_template() { # the template of the current state, ready to clone; every url, env and build marks it in use
+  local log="$common/testdb-$NAME-$TPL.build.log" gone="$common/testdb-$NAME-$TPL.tainted" rc changed new t0
+  mkdir -p "$TUSED/$NAME"; touch "$TUSED/$NAME/$TPL"
+  tpl_ready && return 0
+  t0="$(date +%s)"; build_lock
+  # while this waited, a build of the same template may have taken the server out of service: the same answer
+  [ ! -f "$gone" ] || [ "$(stat -c %Y "$gone")" -lt "$t0" ] || die "$(cat "$gone")"
+  [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = true ] || server_up
+  if ! tpl_ready; then
+    # a database under the template's name that is not flagged one: a build or a template drop stopped midway
+    [ -z "$(q "select 1 from pg_database where datname = '$TPL'")" ] || q "drop database \"$TPL\" with (force)" >/dev/null
+    touch "$TUSED/$NAME/$TPL"; reap_templates room
+    # the build's output goes to a log, so the first suite's caller does not carry it (wingbarn pilot); its tail
+    # and path are printed only when it fails
+    set +e; ( set -e; build_template ) > "$log" 2>&1; rc=$?; set -e
+    if [ "$rc" = 3 ]; then
+      changed="$(sed -n 's/^testdb: roles changed: //p' "$log" | tail -1)"
+      new="$(taint)" || new="(the rename failed; testdb down removes it)"
+      printf 'building %s: migrate or seed changed cluster-wide roles (%s). A server is shared by every migration state with the same roles, so role changes go in TESTDB_ROLES (or TESTDB_SERVER=state in .agents/testdb.conf keeps a server per state). %s left service as %s; clones already handed out keep working; the whole log: %s\n' \
+        "$TPL" "$changed" "$NAME" "$new" "$log" > "$gone"
+      die "$(cat "$gone")"
+    fi
+    [ "$rc" = 0 ] || { tail -n 20 "$log" >&2; die "building $TPL failed; nothing was kept; the whole log: $log"; }
+  fi
+  exec 8>&-
+}
+
+# --- clones and their owners -----------------------------------------------------------------------------------------
+
+proc_field() { [ -r "/proc/$1/stat" ] && sed 's/.*) //' "/proc/$1/stat" | cut -d' ' -f"$2"; }   # after "pid (comm) "
+proc_start() { proc_field "$1" 20; }   # field 22: start time
+owner_of_caller() { # the process testdb was run for, as the lease records it: TESTDB_OWNER when set, else the first
+  # ancestor that is not a shell (a runner's `sh -c` exits at once; the pytest or node worker above it is the owner)
+  local ns start pid="${TESTDB_OWNER:-$PPID}" up
+  [[ "$pid" =~ ^[0-9]+$ ]] || die "TESTDB_OWNER must be a process id"
+  while [ -z "${TESTDB_OWNER:-}" ] && [ "$pid" -gt 1 ]; do
+    case "$(cat "/proc/$pid/comm" 2>/dev/null)" in sh|dash|bash|zsh|ksh|env) ;; *) break ;; esac
+    up="$(proc_field "$pid" 2)" || break; [ -n "$up" ] && [ "$up" -gt 1 ] || break; pid="$up"
+  done
+  ns="$(readlink /proc/self/ns/pid 2>/dev/null)" && start="$(proc_start "$pid")" && [ -n "$start" ] && printf '%s %s %s\n' "$ns" "$pid" "$start"
+}
+owner_state() { # $1 lease file → alive, gone or unknown (no lease, another PID namespace, or no /proc)
+  local ns pid start
+  [ -s "$1" ] && read -r ns pid start < "$1" && [ "$ns" = "$(readlink /proc/self/ns/pid 2>/dev/null)" ] || { echo unknown; return 0; }
+  if [ "$(proc_start "$pid" 2>/dev/null)" = "$start" ]; then echo alive; else echo gone; fi
+}
+
+clone() { # sets CLONE, leased to the caller. A failure is retried once, after making sure of the server and the
+  # template: a neighbour's reap may have dropped it, or cleared its flag to drop it, or the server left service
+  local strategy="" err first="" try
+  [ "$(q 'show server_version_num')" -lt 150000 ] || strategy=" strategy file_copy"
+  for try in 1 2; do
+    CLONE="t_$(date +%s)_${PPID}_$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"; mkdir -p "$LEASES/$NAME"
+    owner_of_caller > "$LEASES/$NAME/$CLONE" || : > "$LEASES/$NAME/$CLONE"   # no /proc: an unknown owner, reaped by age
+    err="$(q "create database \"$CLONE\" template \"$TPL\"$strategy" 2>&1 >/dev/null)" && return 0
+    rm -f "$LEASES/$NAME/$CLONE"
+    [ "$try" = 1 ] || die "creating a clone failed twice (${first:-?}; then ${err:-?}); if the RAM disk is full, testdb status shows the clones and TESTDB_RAM raises the cap"
+    first="$err"; server_up; ensure_template
+  done
+}
+
+role_ok() { [[ "$1" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "'$1' is not a role name testdb accepts"; }
+role_checks() { # $1 role, $2 clone → dies unless connecting as it keeps row-level security in force
+  local r
+  [ "$1" = postgres ] && return 0
+  # each query's failure is its own refusal: a caller's `|| exit 1` turns errexit off in here, and an empty answer
+  # from a failed query would otherwise read as a pass
+  r="$(q "select rolcanlogin::int::text || rolsuper::int::text || rolbypassrls::int::text from pg_catalog.pg_roles where rolname = '$1'")" \
+    || die "could not read role $1; not approved"
+  [ -n "$r" ] || die "role $1 does not exist (create it with LOGIN in TESTDB_ROLES)"
+  [ "$r" = 100 ] || die "role $1 must have LOGIN and neither SUPERUSER nor BYPASSRLS, or row-level security is not tested"
+  # the owner's rights, held directly or inherited through membership, are what RLS exempts (pg_has_role USAGE)
+  r="$(q "select pg_catalog.string_agg(c.relname, ', ') from pg_catalog.pg_class c where c.relrowsecurity and not c.relforcerowsecurity and pg_catalog.pg_has_role('$1', c.relowner, 'USAGE')" "$2")" \
+    || die "could not read which tables role $1 holds the owner's rights on; not approved"
+  [ -z "$r" ] || die "role $1 has the owner's rights on $r with row-level security not forced, so its policies do not apply to it (ALTER TABLE … FORCE ROW LEVEL SECURITY, or test as a role that neither owns them nor inherits their owner)"
+}
+
+reap() {
+  local now n ts state srv alive
+  now="$(date +%s)"
+  while IFS= read -r n; do   # clones: the owner gone → dropped now; owner unknown → past TESTDB_MAX_AGE; a live owner's → kept
+    [ -n "$n" ] || continue
+    ts="${n#t_}"; ts="${ts%%_*}"; state="$(owner_state "$LEASES/$NAME/$n")"
+    if [ "$state" = gone ] || { [ "$state" = unknown ] && [ $((now - ts)) -gt "$MAXAGE" ]; }; then
+      q "drop database if exists \"$n\" with (force)" >/dev/null && rm -f "$LEASES/$NAME/$n"
+    fi
+  done < <(q "select datname from pg_database where datname ~ '^t_[0-9]+_[0-9]+_[0-9a-f]{6}\$'")
+  while IFS= read -r n; do   # half-built templates a killed run left behind
+    [ -n "$n" ] || continue
+    ts="${n#b_*_}"; ts="${ts%%_*}"
+    [ $((now - ts)) -gt 3600 ] && q "drop database if exists \"$n\" with (force)" >/dev/null
+  done < <(q "select datname from pg_database where datname ~ '^b_[0-9a-f]{16}_[0-9]+_[0-9]+\$'")
+  # templates idle an hour; skipped while a build holds the lock, so a url never waits on a neighbour's build
+  if build_lock -n; then reap_templates; fi
+  exec 8>&-
+  for srv in $(docker ps -a --filter label=os.testdb=1 --filter "label=os.testdb.repo=$common" --format '{{.Names}}'); do
+    [ "$srv" != "$NAME" ] || continue
+    if ! [[ "$srv" =~ -x[0-9]+$ ]]; then   # out of service (the role guard): gone once no live owner holds a clone
+      [ -f "$USED/$srv" ] || continue   # no mark: another run is starting it; left alone
+      [ $((now - $(stat -c %Y "$USED/$srv"))) -gt 86400 ] || continue
+    fi
+    alive=""
+    for n in "$LEASES/$srv"/*; do [ -f "$n" ] && [ "$(owner_state "$n")" = alive ] && { alive=1; break; }; done
+    [ -z "$alive" ] || continue
+    docker rm -f "$srv" >/dev/null 2>&1 && forget "$srv"
+  done
+}
+forget() { # $1 a removed server: its marks, leases, locks and logs
+  rm -rf "${USED:?}/$1" "${LEASES:?}/$1" "${TUSED:?}/$1" "$common/testdb-$1".*lock "$common/testdb-$1".build.log "$common/testdb-$1"-tpl_*.build.log "$common/testdb-$1"-tpl_*.tainted
+}
+
+case "$cmd" in
+  id) state_names; echo "$NAME $TPL" ;;
+  guard) guard; echo "testdb: no variable points at a non-local Postgres" ;;
+  up) guard; state_names; server_up; db_url postgres ;;
+  build) guard; state_names; server_up; ensure_template; echo "testdb: $TPL is ready on $NAME" ;;
+  url)
+    role=postgres
+    if [ "${1:-}" = --role ]; then [ -n "${2:-}" ] || die "--role needs a role"; role="$2"; fi
+    role_ok "$role"; guard; state_names; server_up; reap; ensure_template
+    clone; n="$CLONE"; role_checks "$role" "$n" || exit 1
+    db_url "$n" "$role" ;;
+  env)
+    for pair in $ENVMAP; do
+      [[ "${pair%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "TESTDB_ENV: '${pair%%=*}' is not a variable name"
+      role_ok "${pair#*=}"
+    done
+    guard; state_names; server_up; reap; ensure_template; clone; n="$CLONE"
+    for pair in $ENVMAP; do role_checks "${pair#*=}" "$n" || exit 1; printf '%s=%s\n' "${pair%%=*}" "$(db_url "$n" "${pair#*=}")"; done ;;
+  drop)
+    [ -n "${1:-}" ] || die "drop needs a URL or a database name"
+    n="${1%%\?*}"; n="${n##*/}"
+    [[ "$n" =~ ^t_[0-9]+_[0-9]+_[0-9a-f]{6}$ ]] || die "'$n' is not a database testdb made; not dropped"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    if [[ "$1" == *://* ]]; then   # the server that URL names: after a migration change it is not the current one
+      loopback_url "$1" || die "'$1' is not a loopback URL; not dropped"
+      port="${1#*://}"; port="${port%%[/?]*}"; port="${port##*@}"; port="${port##*:}"
+      NAME=""
+      for c in $(docker ps --filter label=os.testdb=1 --filter "label=os.testdb.repo=$common" --format '{{.Names}}'); do
+        [ "$(docker port "$c" 5432/tcp 2>/dev/null | head -1)" = "127.0.0.1:$port" ] && { NAME="$c"; break; }
+      done
+      [ -n "$NAME" ] || exit 0   # its server is gone, and the clone with it
+    else
+      state_names
+      st="$(docker inspect -f '{{index .Config.Labels "os.testdb"}}|{{index .Config.Labels "os.testdb.repo"}}|{{.State.Running}}' "$NAME" 2>/dev/null)" || exit 0
+      [ "${st%|*}" = "1|$common" ] || die "a container named $NAME exists and testdb did not make it; left alone (it is not a testdb server of this repo)"
+      [ "${st##*|}" = true ] || { rm -f "$LEASES/$NAME/$n"; exit 0; }   # stopped: its RAM disk, and the clone, are gone
+    fi
+    q "drop database if exists \"$n\" with (force)" >/dev/null && rm -f "$LEASES/$NAME/$n" ;;
+  reap) state_names; server_up; reap ;;
+  down)
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    if HASH="$(template_hash 2>/dev/null)" && NAME="$PREFIX-$(server_key)" && docker inspect "$NAME" >/dev/null 2>&1 \
+      && [ "$(docker inspect -f '{{index .Config.Labels "os.testdb"}}' "$NAME")" != 1 ]; then
+      echo "testdb: $NAME was not made by testdb; left alone"
+    fi
+    for n in $(docker ps -a --filter label=os.testdb=1 --filter "label=os.testdb.repo=$common" --format '{{.Names}}'); do
+      docker rm -f "$n" >/dev/null && forget "$n" && echo "testdb: $n removed"
+    done ;;
+  status)
+    state_names; server_up
+    echo "server: $(db_url postgres) ($NAME)"
+    q "select 'template '||datname from pg_database where datname ~ '^tpl_' order by 1" | sed "s/^template $TPL\$/& (current)/"
+    echo "clones: $(q "select count(*) from pg_database where datname ~ '^t_[0-9]+_'")"
+    echo "servers of this repo: $(docker ps -a --filter label=os.testdb=1 --filter "label=os.testdb.repo=$common" --format '{{.Names}}' | paste -sd' ' -)" ;;
+esac

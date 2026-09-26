@@ -26,6 +26,8 @@ for what you cannot resolve yourself: credentials, spend, priority, or a scope c
   perspective.
 - Auth, money, migrations, security, destructive data, cross-tenant: another family reviews the
   plan first, then both other families review the code.
+- A review voice that is out never stops work: the unit closes on the voices that answer (none
+  answering still stops it), and `os review --sweep` has the absent voice read it when it is back.
 - Deterministic checks run before any model, and a review unit is at most 400 changed lines:
   `os review` refuses a larger diff and prints the split. Tier 2 ships a risk map, tier 3 a
   boundary table (what the change reads, writes, spawns, parses, and how each path fails);
@@ -37,13 +39,15 @@ for what you cannot resolve yourself: credentials, spend, priority, or a scope c
 
 ## Working state lives in the repo
 
-- Read `docs/HANDOFF.md` first, then the two memory indexes: `.agents/memory/MEMORY.md` (this repo)
-  and `~/.agents/memory/MEMORY.md` (what holds across repos). Write the handoff at close. Plans live
+- Run `os boot` first (it fixes this repo's OS drift and is silent otherwise). Then read
+  `docs/HANDOFF.md`, then the two memory indexes: `.agents/memory/MEMORY.md` (this repo) and
+  `~/.agents/memory/MEMORY.md` (what holds across repos). Write the handoff at close. Plans live
   in `plans/`. A durable fact becomes a topic file in the memory it belongs to, indexed by one line:
   what is specific to this repo in `.agents/memory/`; research on a tool, vendor, service or model
   that other repos could use in `~/.agents/memory/<topic>.md`, one file per topic, edited in place
-  by any repo, and linked from this repo's memory rather than copied. Chat history does not travel
-  between harnesses.
+  by any repo, and linked from this repo's memory rather than copied. Before re-deriving a gotcha
+  or a decision, search what is known: `os recall <words>`. Chat history does not travel between
+  harnesses.
 - The project section of `AGENTS.md` (below `os:project:start`) is this repo's own and reads the
   same on every harness: how to run, test and deploy it and the boundaries every turn needs, a
   page (60 lines) at most; a standing fact goes to memory, state to the handoff, and a rule only
@@ -58,9 +62,9 @@ for what you cannot resolve yourself: credentials, spend, priority, or a scope c
   session. The OS session triages the inbox and the parked cases at its start: adopt, absorb,
   route to the harness that owns the binding, or reject with the reason kept in `inbox/rejected/`.
 - Delegate big reads and disjoint lanes to agents; keep judgment here. Delegate at the
-  lowest model that does the job: Sonnet-class reads and implements, Opus-class guards
-  security, your own model only where judgment is the work. A loop needs an independent
-  checker and a stop condition; the maker never grades its own work.
+  subagent model your harness's slot in the DESIGN § 1 matrix names (volume is low, so it is
+  chosen for capability, not price); security work runs at the strongest model the harness has.
+  A loop needs an independent checker and a stop condition; the maker never grades its own work.
 
 ## Same rules on every harness
 

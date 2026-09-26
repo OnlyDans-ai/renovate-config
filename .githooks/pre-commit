@@ -20,20 +20,54 @@ fi
 neutral="$(mktemp -d)" && [ -d "$neutral" ] || { echo "pre-commit BLOCKED: cannot create a scratch directory (TMPDIR?)" >&2; exit 1; }
 trap 'rm -rf "$neutral"' EXIT
 list="$neutral/.list"; blob="$neutral/.blob"
+# gitleaks skips a stream its sniffer takes for binary, so a text blob that opens with %PDF- was never scanned (measured
+# 2026-09-23 on 8.30.1). A blob with no NUL byte is text: it goes behind one 512-byte text line (stdin findings print no
+# line number, so nothing shifts). A blob with a NUL keeps gitleaks' own reading, as the agy tree export does. The copy is
+# a file gitleaks reads by redirection, never a pipe: gitleaks stops early on a binary, and under pipefail the writer's
+# SIGPIPE would block the commit (Codex, plan review: /bin/ls, producer 141, gitleaks 0).
+sniffproof() { # $1 blob → the path to scan: $1 itself when it has a NUL byte, else $neutral/.scan (the line, then the blob);
+  # 1 when the copy could not be written whole (a short copy would scan less: the caller blocks)
+  if tr -d '\000' < "$1" | cmp -s - "$1"; then
+    { printf '%512s\n' '' | tr ' ' '#' && cat -- "$1"; } > "$neutral/.scan" || return 1
+    echo "$neutral/.scan"
+  else echo "$1"; fi
+}
+# The rule ids gitleaks reports for a blob on stdin, sorted, one per line; the matched text is never read.
+rules_of() { rm -f "$neutral/.report"; (cd "$neutral" && env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML gitleaks stdin --no-banner --redact --ignore-gitleaks-allow --log-level error --report-format json --report-path "$neutral/.report" >/dev/null 2>&1); grep -o '"RuleID": *"[^"]*"' "$neutral/.report" 2>/dev/null | sed 's/.*"\([^"]*\)"$/\1/' | sort; }
 git diff --staged --name-only --diff-filter=d -z > "$list" || { echo "pre-commit BLOCKED: git diff --staged failed; nothing was scanned" >&2; exit 1; }
 rc=0
 while IFS= read -r -d '' f; do
   [ -n "$f" ] || continue
   # :0:<path>, stage zero spelled out: a path that begins with a digit and a colon would otherwise be read as a stage
   if ! git show ":0:$f" > "$blob" 2>/dev/null; then echo "pre-commit: cannot read staged $f from the index" >&2; rc=1; continue; fi
-  if ! (cd "$neutral" && env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML gitleaks stdin --no-banner --redact --ignore-gitleaks-allow -v --log-level warn < "$blob"); then
+  if ! scan="$(sniffproof "$blob")"; then echo "pre-commit: cannot copy staged $f for the scan (disk full?); nothing was scanned" >&2; rc=1; continue; fi
+  if ! (cd "$neutral" && env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML gitleaks stdin --no-banner --redact --ignore-gitleaks-allow -v --log-level warn < "$scan"); then
     echo "pre-commit: likely secret in staged $f (redacted above)" >&2
+    # Whole blobs are scanned, so a value committed long ago blocks the next edit to its file (miah 2026-09-23). Say so
+    # when every rule that fires here fires on HEAD's copy too, and no more: two different values trip the same rule
+    # (Codex, unit review), so the note never claims it is the same value. The commit is blocked all the same.
+    # A merge stages every file the other side changed, so a fixture committed there blocks the merge (onlydans
+    # 2026-09-22). A blob id is the content: byte-identical to MERGE_HEAD's copy is a fact, and it is said as one.
+    # This runs only on a hit (inside the failing branch); an id that does not resolve is empty and never matches.
+    theirs="$(git rev-parse -q --verify "MERGE_HEAD:$f" 2>/dev/null)"; ours="$(git rev-parse -q --verify ":0:$f" 2>/dev/null)"
+    if [ -n "$theirs" ] && [ "$theirs" = "$ours" ]; then
+      echo "pre-commit: staged $f is byte-identical to MERGE_HEAD:$f, the side being merged in — this merge adds nothing new there, and the hook blocks it all the same: rewrite the fixture, here or on that side" >&2
+    fi
+    if git cat-file -e "HEAD:$f" 2>/dev/null; then
+      git show "HEAD:$f" > "$neutral/.head" 2>/dev/null
+      new="$(rules_of < "$scan")"; old="$(hs="$(sniffproof "$neutral/.head")" && rules_of < "$hs")"   # a note only: the commit is blocked already
+      if [ -n "$new" ] && [ -z "$(comm -23 <(printf '%s\n' "$new") <(printf '%s\n' "$old"))" ]; then
+        echo "pre-commit: the same rule(s) fire on HEAD:$f too — a value that trips them was committed before; a rule id says nothing about which value, so check whether this change added one" >&2
+      fi
+    fi
     rc=1
   fi
 done < "$list"
 if [ "$rc" -ne 0 ]; then
   echo "pre-commit BLOCKED: gitleaks found a likely secret in the staged changes." >&2
   echo "Remove it (env var or 1Password, never a tracked file) and re-stage." >&2
+  echo "A test fixture: write the fake value so no rule can take it for real (EXAMPLE, repeated zeros); the rules stay whole." >&2
+  echo "A hash manifest: '<sha256>  <path>' lines or {path, sha256} rows, never keyed by a file or a key-like name." >&2
   exit 1
 fi
 

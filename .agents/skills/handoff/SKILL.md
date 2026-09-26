@@ -1,43 +1,32 @@
 ---
 name: handoff
-description: Capture or resume active work across sessions, hosts, compaction, or quota
-  interruption, using the project's docs/HANDOFF.md and its plan/tracker references. Use at
-  meaningful milestones during sustained work and before switching hosts or parking a task.
+description: Writes or resumes docs/HANDOFF.md, the record of unfinished work that carries a task across sessions,
+  harnesses, compaction or a quota stop. Use at milestones in sustained work, before parking a task or switching hosts,
+  at session close, and when a session continues earlier work.
 ---
 
 # Handoff
 
-`docs/HANDOFF.md` records current state, the next action, evidence, and scoped constraints.
-Plans (`plans/*.md`) own approved design; a small task needs neither a plan nor a tracker.
-Durable memory lives in `.agents/memory/`; the handoff carries unfinished work — the two are
-not the same thing. `os handoff` writes the template if missing, otherwise prints it and the
-git log since its last update so the PM fills it.
+`docs/HANDOFF.md` holds what is unfinished. Approved design lives in `plans/`, durable lessons in `.agents/memory/`.
+`os handoff` writes the template if it is missing, else prints it with the git log since its last update.
 
-## When to checkpoint
+## Writing
 
-Proactively, at meaningful milestones during sustained work — Danny need not request it.
-Keep the task active while working, paused when parked, and completed when its acceptance
-conditions are met. Ordinary one-step work needs no ceremony. A capture does not certify
-completion or waive outstanding review; abrupt interruption can lose unrecorded state.
+Checkpoint at milestones without being asked; one-step work needs none.
 
-Write:
-- **State** — what's true right now, in enough detail that a fresh session doesn't have to
-  re-derive it.
-- **Next action** — the single next concrete step, not a backlog.
-- **Open decisions** — anything still waiting on Danny's word.
-- **Constraints** — anything scoped or time-boxed that a fresh session must not silently drop.
+- **State**: what is true now, with its evidence (commits, review unit ids, logs), so a fresh session re-derives nothing.
+- **Next action**: the single next step.
+- **Open decisions**: what waits on Danny.
+- **Constraints**: anything scoped or time-boxed that must not be dropped.
+
+A handoff records work; it does not certify it done or close a review.
+
+At close, if `os status` prints a `memory:` line, consolidate: merge overlapping topic files, drop what the code now
+says, keep MEMORY.md at one line per file. A lesson that lives only in a plan or in the harness's private store
+becomes a topic file.
 
 ## Resuming
 
-On a fresh session: continue the selected unfinished task unless Danny supplies a different
-objective. Read `docs/HANDOFF.md` first, then its referenced plan/tracker. Reconcile changed
-revisions and dirty work before repeating anything — a report is not evidence; verify claims
-yourself. A host switch grants no new authority and resets no completed work.
-
-## Context lifetime
-
-Continue useful authorized work in the current session; checkpoint at natural phase
-boundaries without pausing work or changing native context. Danny owns interactive
-compaction, new-session, model, and effort controls — this skill never blocks or nags about
-context size; a session cannot see its own token count reliably enough to police it, and a
-2026-model manages its own context well enough to say when it's getting tight.
+Continue the unfinished task unless Danny gives a new objective. Read the handoff, then the plan it names, and
+reconcile moved revisions and dirty work before repeating anything. A new host or session grants no new authority.
+Context size is Danny's to manage; keep working.

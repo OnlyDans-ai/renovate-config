@@ -1,50 +1,32 @@
 ---
 name: new-project
-description: Project inception + OS bootstrap — vision/PRD interview, evidenced stack
-  recommendation, repo scaffolded to standard OS posture. Use when starting ANY new
-  project — "new project", "set up X", "project setup", "start X".
+description: Starts a new project from nothing - vision and PRD interview, an evidenced stack recommendation, then a
+  repo scaffolded to the OS standard. Use when Danny says "new project", "start X", "set up X" for something that has
+  no repo yet, or "project setup".
 ---
 
-# new-project — Inception → PRD → Stack → Scaffold
+# New project
 
-Goal: a new project is born with its vision captured, its requirements written, its stack
-decided on evidence, and its harness conformant — one session instead of an afternoon of
-retrofitting. Two phases, hard gate between them: **Phase A** produces ratified artifacts;
-**Phase B** is mechanical and runs only after Danny ratifies the stack.
+Two phases with a gate between them: nothing is scaffolded until Danny ratifies the PRD and the stack.
 
-## Phase A — Inception
+## Phase A: inception
 
-1. **Interview** (2-3 rounds, batched — never one question at a time): (1) vision — what,
-   for whom, why now, what success looks like; (2) product shape — surfaces, integrations,
-   data sensitivity, scale; (3) constraints — timeline, budget, existing infra to reuse,
-   what's explicitly out. Capture Danny's verbatim phrasing.
-2. **Write `docs/VISION.md`** (narrative, success criteria) and **`docs/PRD.md`**
-   (jobs-to-be-done, requirements, non-goals, milestones v0->v1, open questions). Present
-   both; iterate until ratified. No scaffold before a ratified PRD.
-3. **Stack recommendation** — evidence, then opinion, never vibes. Research the moving parts
-   (web search, package registries) where the space has moved recently. Deliver:
-   `Recommendation: {stack}. Why: {reason traced to a PRD requirement}. Alternatives: {option
-   -> why not}.` Danny ratifies or overrides.
+1. Interview in two or three batched rounds: the vision (what, for whom, why now, what success looks like), the
+   product shape (surfaces, integrations, data sensitivity, scale), and the constraints (timeline, budget, infra to
+   reuse, what is out). Keep Danny's own phrasing.
+2. Write `docs/VISION.md` (narrative, success criteria) and `docs/PRD.md` (jobs to be done, requirements, non-goals,
+   milestones v0 to v1, open questions), and iterate until he ratifies them.
+3. Recommend the stack from current sources, as the consultant skill does, each choice traced to a PRD requirement.
 
-## Phase B — Scaffold (mechanical, profile-scaled)
+## Phase B: scaffold
 
-The interview determines the profile; ceremony scales to it:
+The profile decides the ceremony: a **product** gets all of it; a **website** skips observability unless it has
+real logic; **non-code** gets the repo and the secret posture only. Review follows the change's risk (AGENTS.md),
+whatever the profile.
 
-| Profile | Gets |
-|---|---|
-| **full-product** | Everything below |
-| **website** | Repo init + CLAUDE.md + secret posture + `.gitguardian.yaml`; skips tribunal/observability bindings unless the site has real logic |
-| **non-code** | Repo init + secret posture only |
-
-1. `git init` + first commit with `.gitignore` never-commit classes (`.env*`, `credentials/`,
-   `*.token`); `gh repo create --private` + push; confirm secret-scanning covers the new repo.
-2. `AGENTS.md` core block (copy between `<!-- os:core:start/end -->` from `~/.os/AGENTS.md`)
-   + a project block from `~/.os/templates/AGENTS.project.md` filled with stack/commands/deploy
-   facts from VISION.md and the ratified stack. `CLAUDE.md` = `@AGENTS.md`.
-3. `.agents/skills/` (copy of `~/.os/skills`), `.claude/skills` symlink -> `../.agents/skills`.
-4. `.agents/memory/MEMORY.md`, `.githooks/pre-commit` + `pre-push` (from `~/.os/templates/
-   githooks/`), `git config core.hooksPath .githooks`.
-5. `docs/HANDOFF.md` from the template, `plans/`, `.claude/settings.json` (permissions,
-   `plansDirectory`, `autoMemoryDirectory`), `.agents/deploy-branches` (empty).
-
-Idempotent: never overwrites an existing project block, handoff, or memory.
+1. `git init`, a `.gitignore` covering `.env*`, `credentials/` and `*.token`, a first commit, and
+   `gh repo create --private`. Confirm secret scanning covers the new repo.
+2. `os init .` lays down the OS: AGENTS.md core block, CLAUDE.md pointer, skills, memory, handoff, git hooks,
+   `.claude/settings.json`, `.agents/deploy-branches`, MCP files. It never overwrites what exists.
+3. Fill the AGENTS.md project section (stack, run, test, deploy) from the PRD and the ratified stack.
+4. Set up `.agents/check` and the CI workflow as the test-tiers skill describes.

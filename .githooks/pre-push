@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # os-hook: pre-push — deploy-branch grant check (block), unreviewed-commit count (advisory).
+# os-push-grant: per-repo, all
 # Installed by os init and refreshed by os sync; the repo's own pre-push runs after it as .githooks/pre-push.local,
 # with the same arguments and the same ref lines on stdin.
 set -uo pipefail
 
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 DEPLOY_FILE="$REPO/.agents/deploy-branches"
-GRANT_FILE="$HOME/.os/push-grant"
+GRANT_DIR="$HOME/.os/push-grants"
 ZERO='0000000000000000000000000000000000000000'
 
 is_deploy_branch() { # $1 = bare branch name
@@ -14,13 +15,24 @@ is_deploy_branch() { # $1 = bare branch name
   grep -Fxq "$1" "$DEPLOY_FILE" 2>/dev/null
 }
 
-grant_valid() {
-  [ -f "$GRANT_FILE" ] || return 1
+grant_valid() { # this repo's own grant (the file os push-ok wrote for this repo's git common dir, naming it), or the
+  # all-repos window (os push-ok --all: repo=*), unexpired. Every doubt is no grant (~/projects/os/plans/push-grant-per-repo-2026-09-25.md).
+  local id key f
+  if id="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" && [ -n "$id" ] \
+    && id="$(readlink -f -- "$id")" && [ -n "$id" ]; then
+    key="$(printf '%s' "$id" | sha256sum 2>/dev/null | cut -c1-16)"
+    if [ "${#key}" -eq 16 ]; then f="$GRANT_DIR/$key"; grant_file_open "$f" "$id" && return 0; fi
+  fi
+  grant_file_open "$GRANT_DIR/all" "*"
+}
+grant_file_open() { # $1 file, $2 the repo= value it must hold → 0 when it holds it and an expiry still ahead
   local expires now
-  expires="$(sed -n 's/^expires=//p' "$GRANT_FILE" | head -1)"
-  [ -n "$expires" ] || return 1
+  [ -f "$1" ] || return 1
+  [ "$(sed -n 's/^repo=//p' "$1" | head -1)" = "$2" ] || return 1
+  expires="$(sed -n 's/^expires=//p' "$1" | head -1)"
+  [[ "$expires" =~ ^[0-9]+$ ]] || return 1
   now="$(date +%s)"
-  [ "$expires" -gt "$now" ] 2>/dev/null
+  [ "$expires" -gt "$now" ]
 }
 
 # stdin (one line per ref being pushed) is kept in a file so the repo's own hook can read the same lines
@@ -35,8 +47,8 @@ while read -r _localref localsha remoteref _remotesha; do
   branch="${remoteref#refs/heads/}"
   is_deploy_branch "$branch" || continue
   if ! grant_valid; then
-    echo "PRE-PUSH BLOCKED: '$branch' is a deploy branch and there is no unexpired push grant." >&2
-    echo "Get Danny's word, then: os push-ok <duration>  (e.g. os push-ok 2h)" >&2
+    echo "PRE-PUSH BLOCKED: '$branch' is a deploy branch and this repo has no unexpired push grant." >&2
+    echo "Get Danny's word, then, in this repo: os push-ok <duration>  (e.g. os push-ok 2h), or for every repo: os push-ok 12h --all" >&2
     blocked=1
   fi
 done < "$REFS"
